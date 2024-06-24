@@ -43,10 +43,12 @@ import com.amazonaws.athena.connector.lambda.security.FederatedIdentity;
 import com.amazonaws.athena.connector.lambda.security.LocalKeyFactory;
 import com.amazonaws.services.athena.AmazonAthena;
 import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.model.PutObjectRequest;
 import com.amazonaws.services.s3.model.PutObjectResult;
 import com.amazonaws.services.s3.model.S3Object;
 import com.amazonaws.services.s3.model.S3ObjectInputStream;
 import com.amazonaws.services.secretsmanager.AWSSecretsManager;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.io.ByteStreams;
 import com.teradata.tpcds.Table;
 import com.teradata.tpcds.column.Column;
@@ -58,7 +60,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.invocation.InvocationOnMock;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,12 +73,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static com.amazonaws.athena.connector.lambda.domain.predicate.Constraints.DEFAULT_NO_LIMIT;
 import static com.amazonaws.athena.connectors.tpcds.TPCDSMetadataHandler.SPLIT_NUMBER_FIELD;
 import static com.amazonaws.athena.connectors.tpcds.TPCDSMetadataHandler.SPLIT_SCALE_FACTOR_FIELD;
 import static com.amazonaws.athena.connectors.tpcds.TPCDSMetadataHandler.SPLIT_TOTAL_NUMBER_FIELD;
 import static org.junit.Assert.*;
-import static org.mockito.Matchers.anyObject;
-import static org.mockito.Matchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -121,14 +124,14 @@ public class TPCDSRecordHandlerTest
 
         mockS3Storage = new ArrayList<>();
         allocator = new BlockAllocatorImpl();
-        handler = new TPCDSRecordHandler(mockS3, mockSecretsManager, mockAthena);
+        handler = new TPCDSRecordHandler(mockS3, mockSecretsManager, mockAthena, com.google.common.collect.ImmutableMap.of());
         spillReader = new S3BlockSpillReader(mockS3, allocator);
 
-        when(mockS3.putObject(anyObject(), anyObject(), anyObject(), anyObject()))
+        when(mockS3.putObject(any()))
                 .thenAnswer((InvocationOnMock invocationOnMock) ->
                 {
                     synchronized (mockS3Storage) {
-                        InputStream inputStream = (InputStream) invocationOnMock.getArguments()[2];
+                        InputStream inputStream = ((PutObjectRequest) invocationOnMock.getArguments()[0]).getInputStream();
                         ByteHolder byteHolder = new ByteHolder();
                         byteHolder.setBytes(ByteStreams.toByteArray(inputStream));
                         mockS3Storage.add(byteHolder);
@@ -136,7 +139,7 @@ public class TPCDSRecordHandlerTest
                     }
                 });
 
-        when(mockS3.getObject(anyString(), anyString()))
+        when(mockS3.getObject(nullable(String.class), nullable(String.class)))
                 .thenAnswer((InvocationOnMock invocationOnMock) ->
                 {
                     synchronized (mockS3Storage) {
@@ -186,7 +189,7 @@ public class TPCDSRecordHandlerTest
                         .add(SPLIT_TOTAL_NUMBER_FIELD, "1000")
                         .add(SPLIT_SCALE_FACTOR_FIELD, "1")
                         .build(),
-                new Constraints(constraintsMap),
+                new Constraints(constraintsMap, Collections.emptyList(), Collections.emptyList(), DEFAULT_NO_LIMIT),
                 100_000_000_000L,
                 100_000_000_000L //100GB don't expect this to spill
         );
@@ -230,7 +233,7 @@ public class TPCDSRecordHandlerTest
                         .add(SPLIT_TOTAL_NUMBER_FIELD, "10000")
                         .add(SPLIT_SCALE_FACTOR_FIELD, "1")
                         .build(),
-                new Constraints(constraintsMap),
+                new Constraints(constraintsMap, Collections.emptyList(), Collections.emptyList(), DEFAULT_NO_LIMIT),
                 1_500_000L, //~1.5MB so we should see some spill
                 0
         );
@@ -259,6 +262,52 @@ public class TPCDSRecordHandlerTest
         }
 
         logger.info("doReadRecordsSpill: exit");
+    }
+
+    @Test
+    public void doReadRecordForTPCDSTIMETypeColumn()
+            throws Exception
+    {
+        for (Table next : Table.getBaseTables()) {
+            if (next.getName().equals("dbgen_version")) {
+                table = next;
+            }
+        }
+        SchemaBuilder schemaBuilder = SchemaBuilder.newBuilder();
+        for (Column nextCol : table.getColumns()) {
+            schemaBuilder.addField(TPCDSUtils.convertColumn(nextCol));
+        }
+
+        ReadRecordsRequest request = new ReadRecordsRequest(identity,
+                "catalog",
+                "queryId-" + System.currentTimeMillis(),
+                new TableName("tpcds1", table.getName()),
+                schemaBuilder.build(),
+                Split.newBuilder(S3SpillLocation.newBuilder()
+                                .withBucket(UUID.randomUUID().toString())
+                                .withSplitId(UUID.randomUUID().toString())
+                                .withQueryId(UUID.randomUUID().toString())
+                                .withIsDirectory(true)
+                                .build(),
+                        keyFactory.create())
+                        .add(SPLIT_NUMBER_FIELD, "0")
+                        .add(SPLIT_TOTAL_NUMBER_FIELD, "1000")
+                        .add(SPLIT_SCALE_FACTOR_FIELD, "1")
+                        .build(),
+                new Constraints(ImmutableMap.of(), Collections.emptyList(), Collections.emptyList(), DEFAULT_NO_LIMIT, Collections.emptyMap()),
+                100_000_000_000L,
+                100_000_000_000L
+        );
+        RecordResponse rawResponse = handler.doReadRecords(allocator, request);
+
+        assertTrue(rawResponse instanceof ReadRecordsResponse);
+
+        ReadRecordsResponse response = (ReadRecordsResponse) rawResponse;
+
+        logger.info("doReadRecordForTPCDSTIMETypeColumn: {}", BlockUtils.rowToString(response.getRecords(), 0));
+        assertEquals(1, response.getRecords().getRowCount()); // TPCDS for `dbgen_version` always generates 1 record.
+
+        logger.info("doReadRecordForTPCDSTIMETypeColumn: exit");
     }
 
     private class ByteHolder

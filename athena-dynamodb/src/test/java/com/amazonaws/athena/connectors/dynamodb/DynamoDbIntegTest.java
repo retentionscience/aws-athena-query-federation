@@ -22,14 +22,19 @@ package com.amazonaws.athena.connectors.dynamodb;
 import com.amazonaws.athena.connector.integ.IntegrationTestBase;
 import com.amazonaws.services.athena.model.Row;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.testng.AssertJUnit;
 import org.testng.annotations.Test;
 import software.amazon.awscdk.core.Stack;
 import software.amazon.awscdk.services.iam.Effect;
 import software.amazon.awscdk.services.iam.PolicyDocument;
 import software.amazon.awscdk.services.iam.PolicyStatement;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -47,8 +52,11 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
 
     private final String dynamodbDbName;
     private final String lambdaFunctionName;
-    private final String tableName;
-    private final DdbTableUtils ddbTableUtils;
+    private final String movieTableName;
+    private final DdbTableUtils tableUtils;
+
+    private static final String DDB_PARTITION_KEY = "title";
+    private static final String DDB_SORT_KEY = "year";
 
     public DynamoDbIntegTest()
     {
@@ -56,10 +64,74 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
                 new RuntimeException("user_settings attribute must be provided in test-config.json."));
         dynamodbDbName = (String) userSettings.get("dynamodb_db_name");
         lambdaFunctionName = getLambdaFunctionName();
-        tableName = String.format("dynamodbit_%s", UUID.randomUUID().toString().replace('-', '_'));
-        ddbTableUtils = new DdbTableUtils(tableName);
+        movieTableName = String.format("dynamodbit_%s", UUID.randomUUID().toString().replace('-', '_'));
+        tableUtils = new DdbTableUtils();
     }
 
+    /**
+     * Insert rows into the newly created DDB table.
+     */
+    protected void addMovieItems()
+    {
+        tableUtils.putItem(movieTableName, createMovieItem("2014", "Interstellar", "Christopher Nolan",
+                ImmutableList.of("Matthew McConaughey", "John Lithgow", "Ann Hathaway",
+                        "David Gyasi", "Michael Caine", "Jessica Chastain",
+                        "Matt Damon", "Casey Affleck"),
+                ImmutableList.of("Adventure", "Drama", "Sci-Fi", "Thriller")));
+        tableUtils.putItem(movieTableName, createMovieItem("1986", "Aliens", "James Cameron",
+                ImmutableList.of("Sigourney Weaver", "Paul Reiser", "Lance Henriksen",
+                        "Bill Paxton"),
+                ImmutableList.of("Adventure", "Action", "Sci-Fi", "Thriller")));
+    }
+
+    private void addDatatypeItems()
+    {
+        Map<String, AttributeValue> item = new ImmutableMap.Builder<String, AttributeValue>()
+                .put("int_type", AttributeValue.builder().n(String.valueOf(TEST_DATATYPES_INT_VALUE)).build())
+                .put("smallint_type", AttributeValue.builder().n(String.valueOf(TEST_DATATYPES_SHORT_VALUE)).build())
+                .put("bigint_type", AttributeValue.builder().n(String.valueOf(TEST_DATATYPES_LONG_VALUE)).build())
+                .put("varchar_type", AttributeValue.builder().s(TEST_DATATYPES_VARCHAR_VALUE).build())
+                .put("boolean_type", AttributeValue.builder().bool(TEST_DATATYPES_BOOLEAN_VALUE).build())
+                .put("float4_type", AttributeValue.builder().s(String.valueOf(TEST_DATATYPES_SINGLE_PRECISION_VALUE)).build())
+                .put("float8_type", AttributeValue.builder().s(String.valueOf(1E-130)).build()) // smallest number dynamo can handle
+                .put("date_type", AttributeValue.builder().s(TEST_DATATYPES_DATE_VALUE).build())
+                .put("timestamp_type", AttributeValue.builder().s(TEST_DATATYPES_TIMESTAMP_VALUE).build())
+                .put("byte_type", AttributeValue.builder().b(SdkBytes.fromByteBuffer(ByteBuffer.wrap(TEST_DATATYPES_BYTE_ARRAY_VALUE))).build())
+                .put("textarray_type", AttributeValue.builder().s(TEST_DATATYPES_VARCHAR_ARRAY_VALUE).build())
+                .build();
+        tableUtils.putItem(TEST_DATATYPES_TABLE_NAME, item);
+    }
+
+
+    /**
+     * Creates and returns a Map containing the item's attributes and adds the item to the table.
+     * @param year Year attribute.
+     * @param title Title attribute.
+     * @param director Director attribute.
+     * @param cast List of cast members.
+     * @param genre List of movie generes.
+     */
+    private Map<String, AttributeValue> createMovieItem(String year, String title, String director,
+                                                        List<String> cast, List<String> genre)
+    {
+        logger.info("Add item: year=[{}], title=[{}], director=[{}], cast={}, genre={}",
+                year, title, director, cast, genre);
+
+        List<AttributeValue> castAttrib = new ArrayList<>();
+        cast.forEach(value -> castAttrib.add(AttributeValue.builder().s(value).build()));
+
+        List<AttributeValue> genreAttrib = new ArrayList<>();
+        genre.forEach(value -> genreAttrib.add(AttributeValue.builder().s(value).build()));;
+
+        Map<String, AttributeValue> item = ImmutableMap.of(
+                "year", AttributeValue.builder().n(year).build(),
+                "title", AttributeValue.builder().s(title).build(),
+                "info", AttributeValue.builder().m(ImmutableMap.of(
+                        "director", AttributeValue.builder().s(director).build(),
+                        "cast", AttributeValue.builder().l(castAttrib).build(),
+                        "genre", AttributeValue.builder().l(genreAttrib).build())).build());
+        return item;
+    }
 
     /**
      * Sets up the access policy for the Lambda connector to multiple connector-specific AWS services (e.g. DynamoDB,
@@ -95,7 +167,10 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
     @Override
     protected void setUpStackData(final Stack stack)
     {
-        ddbTableUtils.setupTableStack(stack);
+        tableUtils.setupTableStack(movieTableName, DDB_PARTITION_KEY, DDB_SORT_KEY, stack);
+        tableUtils.setupTableStack(TEST_DATATYPES_TABLE_NAME, "varchar_type", "int_type", stack);
+        tableUtils.setupTableStack(TEST_EMPTY_TABLE_NAME, "varchar_type", "int_type", stack);
+        tableUtils.setupTableStack(TEST_NULL_TABLE_NAME, "varchar_type", "int_type", stack);
     }
 
     /**
@@ -105,10 +180,11 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
     protected void setUpTableData()
     {
         logger.info("----------------------------------------------------");
-        logger.info("Setting up DB table: {}", tableName);
+        logger.info("Setting up DB table: {}", movieTableName);
         logger.info("----------------------------------------------------");
 
-        ddbTableUtils.addItems();
+        addMovieItems();
+        addDatatypeItems();
     }
 
     @Test
@@ -132,7 +208,7 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
 
         List tableNames = listTables(dynamodbDbName);
         logger.info("Tables: {}", tableNames);
-        assertTrue(String.format("Table not found: %s.", tableName), tableNames.contains(tableName));
+        assertTrue(String.format("Table not found: %s.", movieTableName), tableNames.contains(movieTableName));
     }
 
     @Test
@@ -142,7 +218,7 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
         logger.info("Executing describeTableIntegTest");
         logger.info("--------------------------------------");
 
-        Map schema = describeTable(dynamodbDbName, tableName);
+        Map schema = describeTable(dynamodbDbName, movieTableName);
         logger.info("Schema: {}", schema);
         assertEquals("Wrong number of columns found.", 3, schema.size());
         assertTrue("Column not found: title", schema.containsKey("title"));
@@ -162,7 +238,7 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
         logger.info("--------------------------------------------------");
 
         String query = String.format("select title from %s.%s.%s where year > 2000;",
-                lambdaFunctionName, dynamodbDbName, tableName);
+                lambdaFunctionName, dynamodbDbName, movieTableName);
         List<Row> rows = startQueryExecution(query).getResultSet().getRows();
         if (!rows.isEmpty()) {
             // Remove the column-header row
@@ -174,4 +250,30 @@ public class DynamoDbIntegTest extends IntegrationTestBase {
         assertEquals("Wrong number of DB records found.", 1, titles.size());
         assertTrue("Movie title not found: Interstellar.", titles.contains("Interstellar"));
     }
+    @Test
+    public void selectNullValueTest()
+    {
+        // not applicable
+    }
+
+    @Test
+    public void selectFloat8TypeTest()
+    {
+        logger.info("--------------------------------------");
+        logger.info("Executing selectFloat8TypeTest");
+        logger.info("--------------------------------------");
+
+        String query = String.format("select float8_type from %s.%s.%s;",
+                lambdaFunctionName, INTEG_TEST_DATABASE_NAME, TEST_DATATYPES_TABLE_NAME);
+        List<Row> rows = startQueryExecution(query).getResultSet().getRows();
+        if (!rows.isEmpty()) {
+            // Remove the column-header row
+            rows.remove(0);
+        }
+        List<Double> values = new ArrayList<>();
+        rows.forEach(row -> values.add(Double.valueOf(row.getData().get(0).getVarCharValue())));
+        AssertJUnit.assertEquals("Wrong number of DB records found.", 1, values.size());
+        AssertJUnit.assertTrue("Float8 not found: " + 1E-130, values.contains(1E-130));
+    }
+
 }

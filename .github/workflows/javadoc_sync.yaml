@@ -5,21 +5,24 @@ on:
       - master
 jobs:
   build-and-deploy:
-    runs-on: self-hosted
+    runs-on: aws-athena-query-federation_ubuntu-latest_16-core
     steps:
       - name: Checkout
-        uses: actions/checkout@v1
+        uses: actions/checkout@v4
 
-      - name: Set up JDK 1.8
-        uses: actions/setup-java@v1
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
         with:
-          java-version: 1.8
+          distribution: 'corretto'
+          java-version: '11'
 
       - name: Build Javadoc with Maven
-        run: mvn -B javadoc:aggregate --file pom.xml
+        run: mvn -B javadoc:aggregate --file pom.xml -Dorg.slf4j.simpleLogger.defaultLogLevel=WARN --no-transfer-progress
 
       - name: Switch to gh-pages branch
-        run: git checkout gh-pages
+        run: |
+          git fetch
+          git checkout gh-pages
 
       - name: Remove old files
         run: rm -rf com

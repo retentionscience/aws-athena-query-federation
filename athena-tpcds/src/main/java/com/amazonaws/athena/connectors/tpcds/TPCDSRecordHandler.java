@@ -76,15 +76,15 @@ public class TPCDSRecordHandler
      */
     private static final String SOURCE_TYPE = "tpcds";
 
-    public TPCDSRecordHandler()
+    public TPCDSRecordHandler(java.util.Map<String, String> configOptions)
     {
-        super(AmazonS3ClientBuilder.defaultClient(), AWSSecretsManagerClientBuilder.defaultClient(), AmazonAthenaClientBuilder.defaultClient(), SOURCE_TYPE);
+        super(AmazonS3ClientBuilder.defaultClient(), AWSSecretsManagerClientBuilder.defaultClient(), AmazonAthenaClientBuilder.defaultClient(), SOURCE_TYPE, configOptions);
     }
 
     @VisibleForTesting
-    protected TPCDSRecordHandler(AmazonS3 amazonS3, AWSSecretsManager secretsManager, AmazonAthena athena)
+    protected TPCDSRecordHandler(AmazonS3 amazonS3, AWSSecretsManager secretsManager, AmazonAthena athena, java.util.Map<String, String> configOptions)
     {
-        super(amazonS3, secretsManager, athena, SOURCE_TYPE);
+        super(amazonS3, secretsManager, athena, SOURCE_TYPE, configOptions);
     }
 
     /**
@@ -181,7 +181,6 @@ public class TPCDSRecordHandler
     {
         ColumnType type = column.getType();
         switch (type.getBase()) {
-            case TIME:
             case IDENTIFIER:
                 return (Block block, int rowNum, String rawValue) -> {
                     Long value = (rawValue != null) ? Long.parseLong(rawValue) : null;
@@ -202,6 +201,7 @@ public class TPCDSRecordHandler
                     BigDecimal value = (rawValue != null) ? new BigDecimal(rawValue) : null;
                     return block.setValue(field.getName(), rowNum, value);
                 };
+            case TIME:
             case CHAR:
             case VARCHAR:
                 return (Block block, int rowNum, String rawValue) -> {

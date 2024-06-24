@@ -47,6 +47,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,11 +55,11 @@ import java.util.Map;
 import static org.junit.Assert.*;
 
 import static com.amazonaws.athena.connector.lambda.metadata.ListTablesRequest.UNLIMITED_PAGE_SIZE_VALUE;
-import static org.mockito.Matchers.any;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
 public class NeptuneMetadataHandlerTest extends TestBase {
@@ -86,7 +87,7 @@ public class NeptuneMetadataHandlerTest extends TestBase {
         allocator = new BlockAllocatorImpl();
         handler = new NeptuneMetadataHandler(glue,neptuneConnection,
                 new LocalKeyFactory(), mock(AWSSecretsManager.class), mock(AmazonAthena.class), "spill-bucket",
-                "spill-prefix");
+                "spill-prefix", com.google.common.collect.ImmutableMap.of());
         logger.info("setUpBefore - exit");
     }
 
@@ -128,7 +129,7 @@ public class NeptuneMetadataHandlerTest extends TestBase {
 
         ListTablesRequest req = new ListTablesRequest(IDENTITY, "queryId", "default",
                 "default", null, UNLIMITED_PAGE_SIZE_VALUE);
-        when(glue.getTables(any(GetTablesRequest.class))).thenReturn(tableResult);
+        when(glue.getTables(nullable(GetTablesRequest.class))).thenReturn(tableResult);
 
         ListTablesResponse res = handler.doListTables(allocator, req);
 
@@ -165,12 +166,12 @@ public class NeptuneMetadataHandlerTest extends TestBase {
         storageDescriptor.setColumns(columns);
         table.setStorageDescriptor(storageDescriptor);
 
-        GetTableRequest req = new GetTableRequest(IDENTITY, "queryId", "default", new TableName("schema1", "table1"));
+        GetTableRequest req = new GetTableRequest(IDENTITY, "queryId", "default", new TableName("schema1", "table1"), Collections.emptyMap());
 
         GetTableResult getTableResult = new GetTableResult();
         getTableResult.setTable(table);
 
-        when(glue.getTable(any(com.amazonaws.services.glue.model.GetTableRequest.class))).thenReturn(getTableResult);
+        when(glue.getTable(nullable(com.amazonaws.services.glue.model.GetTableRequest.class))).thenReturn(getTableResult);
 
         GetTableResponse res = handler.doGetTable(allocator, req);
 

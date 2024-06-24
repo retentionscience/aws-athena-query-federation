@@ -37,6 +37,7 @@ public enum SupportedTypes
     DATEMILLI(Types.MinorType.DATEMILLI),
     DATEDAY(Types.MinorType.DATEDAY),
     TIMESTAMPMILLITZ(Types.MinorType.TIMESTAMPMILLITZ),
+    TIMESTAMPMICROTZ(Types.MinorType.TIMESTAMPMICROTZ),
     FLOAT8(Types.MinorType.FLOAT8),
     FLOAT4(Types.MinorType.FLOAT4),
     INT(Types.MinorType.INT),
@@ -47,7 +48,8 @@ public enum SupportedTypes
     DECIMAL(Types.MinorType.DECIMAL),
     VARCHAR(Types.MinorType.VARCHAR),
     STRUCT(Types.MinorType.STRUCT),
-    LIST(Types.MinorType.LIST);
+    LIST(Types.MinorType.LIST),
+    MAP(Types.MinorType.MAP);
 
     private Types.MinorType arrowMinorType;
 

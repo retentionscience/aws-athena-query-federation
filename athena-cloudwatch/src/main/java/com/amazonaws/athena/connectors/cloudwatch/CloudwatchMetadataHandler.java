@@ -29,6 +29,8 @@ import com.amazonaws.athena.connector.lambda.domain.Split;
 import com.amazonaws.athena.connector.lambda.domain.TableName;
 import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
 import com.amazonaws.athena.connector.lambda.handlers.MetadataHandler;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesRequest;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableLayoutRequest;
@@ -38,7 +40,9 @@ import com.amazonaws.athena.connector.lambda.metadata.ListSchemasRequest;
 import com.amazonaws.athena.connector.lambda.metadata.ListSchemasResponse;
 import com.amazonaws.athena.connector.lambda.metadata.ListTablesRequest;
 import com.amazonaws.athena.connector.lambda.metadata.ListTablesResponse;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.OptimizationSubType;
 import com.amazonaws.athena.connector.lambda.security.EncryptionKeyFactory;
+import com.amazonaws.athena.connectors.cloudwatch.qpt.CloudwatchQueryPassthrough;
 import com.amazonaws.services.athena.AmazonAthena;
 import com.amazonaws.services.logs.AWSLogs;
 import com.amazonaws.services.logs.AWSLogsClientBuilder;
@@ -46,8 +50,11 @@ import com.amazonaws.services.logs.model.DescribeLogGroupsRequest;
 import com.amazonaws.services.logs.model.DescribeLogGroupsResult;
 import com.amazonaws.services.logs.model.DescribeLogStreamsRequest;
 import com.amazonaws.services.logs.model.DescribeLogStreamsResult;
+import com.amazonaws.services.logs.model.GetQueryResultsResult;
 import com.amazonaws.services.logs.model.LogStream;
+import com.amazonaws.services.logs.model.ResultField;
 import com.amazonaws.services.secretsmanager.AWSSecretsManager;
+import com.google.common.collect.ImmutableMap;
 import org.apache.arrow.util.VisibleForTesting;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.types.Types;
@@ -60,10 +67,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
 
+import static com.amazonaws.athena.connector.lambda.metadata.ListTablesRequest.UNLIMITED_PAGE_SIZE_VALUE;
 import static com.amazonaws.athena.connectors.cloudwatch.CloudwatchExceptionFilter.EXCEPTION_FILTER;
+import static com.amazonaws.athena.connectors.cloudwatch.CloudwatchUtils.getResult;
 
 /**
  * Handles metadata requests for the Athena Cloudwatch Connector.
@@ -114,27 +124,32 @@ public class CloudwatchMetadataHandler
     }
 
     private final AWSLogs awsLogs;
-    private final ThrottlingInvoker invoker = ThrottlingInvoker.newDefaultBuilder(EXCEPTION_FILTER).build();
+    private final ThrottlingInvoker invoker;
     private final CloudwatchTableResolver tableResolver;
+    private final CloudwatchQueryPassthrough queryPassthrough = new CloudwatchQueryPassthrough();
 
-    public CloudwatchMetadataHandler()
+    public CloudwatchMetadataHandler(java.util.Map<String, String> configOptions)
     {
-        super(SOURCE_TYPE);
+        super(SOURCE_TYPE, configOptions);
         this.awsLogs = AWSLogsClientBuilder.standard().build();
-        tableResolver = new CloudwatchTableResolver(invoker, awsLogs, MAX_RESULTS, MAX_RESULTS);
+        this.invoker = ThrottlingInvoker.newDefaultBuilder(EXCEPTION_FILTER, configOptions).build();
+        this.tableResolver = new CloudwatchTableResolver(this.invoker, awsLogs, MAX_RESULTS, MAX_RESULTS);
     }
 
     @VisibleForTesting
-    protected CloudwatchMetadataHandler(AWSLogs awsLogs,
-            EncryptionKeyFactory keyFactory,
-            AWSSecretsManager secretsManager,
-            AmazonAthena athena,
-            String spillBucket,
-            String spillPrefix)
+    protected CloudwatchMetadataHandler(
+        AWSLogs awsLogs,
+        EncryptionKeyFactory keyFactory,
+        AWSSecretsManager secretsManager,
+        AmazonAthena athena,
+        String spillBucket,
+        String spillPrefix,
+        java.util.Map<String, String> configOptions)
     {
-        super(keyFactory, secretsManager, athena, SOURCE_TYPE, spillBucket, spillPrefix);
+        super(keyFactory, secretsManager, athena, SOURCE_TYPE, spillBucket, spillPrefix, configOptions);
         this.awsLogs = awsLogs;
-        tableResolver = new CloudwatchTableResolver(invoker, awsLogs, MAX_RESULTS, MAX_RESULTS);
+        this.invoker = ThrottlingInvoker.newDefaultBuilder(EXCEPTION_FILTER, configOptions).build();
+        this.tableResolver = new CloudwatchTableResolver(this.invoker, awsLogs, MAX_RESULTS, MAX_RESULTS);
     }
 
     /**
@@ -154,7 +169,7 @@ public class CloudwatchMetadataHandler
                 throw new RuntimeException("Too many log groups, exceeded max metadata results for schema count.");
             }
             result = invoker.invoke(() -> awsLogs.describeLogGroups(request));
-            result.getLogGroups().forEach(next -> schemas.add(next.getLogGroupName().toLowerCase()));
+            result.getLogGroups().forEach(next -> schemas.add(next.getLogGroupName()));
             request.setNextToken(result.getNextToken());
             logger.info("doListSchemaNames: Listing log groups {} {}", result.getNextToken(), schemas.size());
         }
@@ -172,26 +187,41 @@ public class CloudwatchMetadataHandler
     public ListTablesResponse doListTables(BlockAllocator blockAllocator, ListTablesRequest listTablesRequest)
             throws TimeoutException
     {
+        String nextToken = null;
         String logGroupName = tableResolver.validateSchema(listTablesRequest.getSchemaName());
         DescribeLogStreamsRequest request = new DescribeLogStreamsRequest(logGroupName);
         DescribeLogStreamsResult result;
         List<TableName> tables = new ArrayList<>();
-        do {
-            if (tables.size() > MAX_RESULTS) {
-                throw new RuntimeException("Too many log streams, exceeded max metadata results for table count.");
+        if (listTablesRequest.getPageSize() == UNLIMITED_PAGE_SIZE_VALUE) {
+            do {
+                if (tables.size() > MAX_RESULTS) {
+                    throw new RuntimeException("Too many log streams, exceeded max metadata results for table count.");
+                }
+                result = invoker.invoke(() -> awsLogs.describeLogStreams(request));
+                result.getLogStreams().forEach(next -> tables.add(toTableName(listTablesRequest, next)));
+                request.setNextToken(result.getNextToken());
+                logger.info("doListTables: Listing log streams  with token {} and size {}", result.getNextToken(), tables.size());
             }
+            while (result.getNextToken() != null);
+        }
+        else {
+            request.setNextToken(listTablesRequest.getNextToken());
+            request.setLimit(listTablesRequest.getPageSize());
             result = invoker.invoke(() -> awsLogs.describeLogStreams(request));
             result.getLogStreams().forEach(next -> tables.add(toTableName(listTablesRequest, next)));
-            request.setNextToken(result.getNextToken());
-            logger.info("doListTables: Listing log streams {} {}", result.getNextToken(), tables.size());
+            nextToken = result.getNextToken();
+            logger.info("doListTables: Listing log streams with token {} and size {}", result.getNextToken(), tables.size());
         }
-        while (result.getNextToken() != null);
 
-        //We add a special table that represents all log streams. This is helpful depending on how
-        //you have your logs organized.
-        tables.add(new TableName(listTablesRequest.getSchemaName(), ALL_LOG_STREAMS_TABLE));
+        // Don't add the ALL_LOG_STREAMS_TABLE unless we're at the end of listing out all the tables.
+        // Otherwise we will end up with multiple ALL_LOG_STREAMS_TABLE showing up in the console.
+        if (nextToken == null) {
+            //We add a special table that represents all log streams. This is helpful depending on how
+            //you have your logs organized.
+            tables.add(new TableName(listTablesRequest.getSchemaName(), ALL_LOG_STREAMS_TABLE));
+        }
 
-        return new ListTablesResponse(listTablesRequest.getCatalogName(), tables, null);
+        return new ListTablesResponse(listTablesRequest.getCatalogName(), tables, nextToken);
     }
 
     /**
@@ -204,9 +234,9 @@ public class CloudwatchMetadataHandler
     public GetTableResponse doGetTable(BlockAllocator blockAllocator, GetTableRequest getTableRequest)
     {
         TableName tableName = getTableRequest.getTableName();
-        tableResolver.validateTable(tableName);
+        CloudwatchTableName cwTableName = tableResolver.validateTable(tableName);
         return new GetTableResponse(getTableRequest.getCatalogName(),
-                getTableRequest.getTableName(),
+                cwTableName.toTableName(),
                 CLOUDWATCH_SCHEMA,
                 Collections.singleton(LOG_STREAM_FIELD));
     }
@@ -221,6 +251,9 @@ public class CloudwatchMetadataHandler
     @Override
     public void enhancePartitionSchema(SchemaBuilder partitionSchemaBuilder, GetTableLayoutRequest request)
     {
+        if (request.getTableName().getQualifiedTableName().equalsIgnoreCase(queryPassthrough.getFunctionSignature())) {
+            return;
+        }
         partitionSchemaBuilder.addField(LOG_STREAM_SIZE_FIELD, new ArrowType.Int(64, true));
         partitionSchemaBuilder.addField(LOG_GROUP_FIELD, Types.MinorType.VARCHAR.getType());
     }
@@ -237,6 +270,10 @@ public class CloudwatchMetadataHandler
     public void getPartitions(BlockWriter blockWriter, GetTableLayoutRequest request, QueryStatusChecker queryStatusChecker)
             throws Exception
     {
+        if (request.getTableName().getQualifiedTableName().equalsIgnoreCase(queryPassthrough.getFunctionSignature())) {
+            return;
+        }
+
         CloudwatchTableName cwTableName = tableResolver.validateTable(request.getTableName());
 
         DescribeLogStreamsRequest cwRequest = new DescribeLogStreamsRequest(cwTableName.getLogGroupName());
@@ -270,6 +307,15 @@ public class CloudwatchMetadataHandler
     @Override
     public GetSplitsResponse doGetSplits(BlockAllocator allocator, GetSplitsRequest request)
     {
+        if (request.getConstraints().isQueryPassThrough()) {
+            //Since this is QPT query we return a fixed split.
+            Map<String, String> qptArguments = request.getConstraints().getQueryPassthroughArguments();
+            return new GetSplitsResponse(request.getCatalogName(),
+                    Split.newBuilder(makeSpillLocation(request), makeEncryptionKey())
+                            .applyProperties(qptArguments)
+                            .build());
+        }
+
         int partitionContd = decodeContinuationToken(request);
         Set<Split> splits = new HashSet<>();
         Block partitions = request.getPartitions();
@@ -303,6 +349,35 @@ public class CloudwatchMetadataHandler
         }
 
         return new GetSplitsResponse(request.getCatalogName(), splits, null);
+    }
+
+    @Override
+    public GetDataSourceCapabilitiesResponse doGetDataSourceCapabilities(BlockAllocator allocator, GetDataSourceCapabilitiesRequest request)
+    {
+        ImmutableMap.Builder<String, List<OptimizationSubType>> capabilities = ImmutableMap.builder();
+        queryPassthrough.addQueryPassthroughCapabilityIfEnabled(capabilities, configOptions);
+
+        return new GetDataSourceCapabilitiesResponse(request.getCatalogName(), capabilities.build());
+    }
+
+    @Override
+    public GetTableResponse doGetQueryPassthroughSchema(BlockAllocator allocator, GetTableRequest request) throws Exception
+    {
+        if (!request.isQueryPassthrough()) {
+            throw new IllegalArgumentException("No Query passed through [{}]" + request);
+        }
+        // to get column names with limit 1
+        GetQueryResultsResult getQueryResultsResult = getResult(invoker, awsLogs, request.getQueryPassthroughArguments(), 1);
+        SchemaBuilder schemaBuilder = SchemaBuilder.newBuilder();
+        if (!getQueryResultsResult.getResults().isEmpty()) {
+            for (ResultField field : getQueryResultsResult.getResults().get(0)) {
+                schemaBuilder.addField(field.getField(), Types.MinorType.VARCHAR.getType());
+            }
+        }
+
+        return new GetTableResponse(request.getCatalogName(),
+                request.getTableName(),
+                schemaBuilder.build());
     }
 
     /**
@@ -340,6 +415,6 @@ public class CloudwatchMetadataHandler
      */
     private TableName toTableName(ListTablesRequest request, LogStream logStream)
     {
-        return new TableName(request.getSchemaName(), logStream.getLogStreamName().toLowerCase());
+        return new TableName(request.getSchemaName(), logStream.getLogStreamName());
     }
 }
